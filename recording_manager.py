@@ -19,6 +19,8 @@ class RecordingHandler:
         eeg_path (str): Absolute path to the EDF/BDF file.
         log_path (str): Absolute path to the CSV log file.
         log (pd.DataFrame): Behavioural event log.
+        trigger_column (str): Log column name containing trigger/event codes.
+        onset_column (str): Log column name containing event onset times.
         sfreq (int): Sampling frequency in Hz.
         dtype (np.dtype): Data type used for signal arrays.
         filetype: pyedflib file type constant.
@@ -27,41 +29,41 @@ class RecordingHandler:
         encodingdict (dict): Mapping of raw to decoded trigger values.
     """
 
-    def __init__(self, eeg_path, log_path):
+    def __init__(self, eeg_path, log_path, trigger_channel_name='Status', trigger_column='trigger', onset_column='onset'):
         """
         Args:
             eeg_path (str): Path to the EDF/BDF recording file.
             log_path (str): Path to the CSV behavioural log.
+            trigger_column (str): Log column containing trigger/event codes
+                (must be integer dtype).
+            onset_column (str): Log column containing event onset times in
+                seconds (must be float dtype).
         """
         self.log_path = os.path.abspath(log_path)
         self.eeg_path = os.path.abspath(eeg_path)
 
-        self.read_log(self.log_path)
-
-        # infer colnames somehow
-        self.trigger_column = 'trigger'
-        self.time_column = 'onset'
+        self.read_log(self.log_path, trigger_column=trigger_column, onset_column=onset_column)
 
         self.reader = pyedflib.EdfReader(self.eeg_path)
 
         self._channels_loaded = []
         self._data = []
 
+        ######################################
         self.dtype = np.int32
         self.sfreq=2048
-        self.filetype = pyedflib.FILETYPE_BDF
-
+        self.filetype = self.reader.filetype
         self.digital = True
+        self._trigger_channel_name = trigger_channel_name
+        ######################################
+
         self.encodingdict = {}
 
-        self._trigger_channel_name = 'Status'
         self.read_data(channels = [self._trigger_channel_name])
         self.bytemask = self.get_bytemask(self._trigger_channel_name)
 
         if self.filetype == 'BDF':
             self._data[self._trigger_idx] = self.decode_channels(self.trigger_channel)
-
-        
 
     ############
     # Properties
@@ -69,36 +71,42 @@ class RecordingHandler:
 
     @property
     def nsamples(self):
+        """int: Total number of samples in the recording (from channel 0)."""
         return self.reader.samples_in_file(0)
 
     @property
     def channels(self):
+        """list[str]: All signal labels present in the EDF/BDF file."""
         return self.reader.getSignalLabels()
 
     @property
     def datarecord_duration(self):
+        """float: Duration of one data record in seconds."""
         return self.reader.datarecord_duration
 
     @property
     def trigger_channel(self):
+        """np.ndarray: The loaded trigger/status channel samples."""
         return self._data[self._trigger_idx]
-    
 
     @property
     def n_channels(self):
+        """int: Number of channels currently loaded into ``_data``."""
         return len(self._data)
-    
 
     @property
     def trigger_default(self):
+        """int: Most common value in the trigger channel (baseline/idle state)."""
         return np.bincount(self.trigger_channel).argmax()
-    
+
     @property
     def ch_headers(self):
+        """list[dict]: Signal headers for each loaded channel."""
         return [self.reader.getSignalHeader(ch) for ch in self._channels_loaded]
-    
+
     @property
     def header(self):
+        """dict: File-level header from the EDF/BDF reader."""
         return self.reader.getHeader()
 
     ##########################
@@ -149,6 +157,11 @@ class RecordingHandler:
         Skips channels already loaded. After loading, re-sorts ``_data`` and
         ``_channels_loaded`` to match the original file order.
 
+        .. note::
+            ``_data`` is replaced on each call (via ``vstack``), invalidating
+            any previously cached views — always access ``trigger_channel``
+            through the property, never store it in a variable across calls.
+
         Args:
             channels (list[str], optional): Channel names to load. Defaults to
                 all channels in the file.
@@ -175,14 +188,42 @@ class RecordingHandler:
         self._trigger_idx = self._channels_loaded.index(self._trigger_channel_name)
 
 
-    def read_log(self, log_path):
-        """Load the CSV behavioural log into ``self.log``.
+    def read_log(self, log_path, trigger_column, onset_column):
+        """Load the behavioural log into ``self.log`` and validate key columns.
+
+        The delimiter is detected automatically. Warns if a column name is not
+        provided or has an unexpected dtype; raises if the column is not found.
 
         Args:
-            log_path (str): Path to the CSV file.
+            log_path (str): Path to the log file.
+            trigger_column (str): Column name for trigger/event codes.
+            onset_column (str): Column name for event onset times.
+
+        Raises:
+            ValueError: If either column is not present in the log.
         """
-        # infer schema?
-        self.log = pd.read_csv(log_path)
+        self.log = pd.read_csv(log_path, sep=None, engine='python')
+
+        cols = [('trigger_column', trigger_column, pd.api.types.is_integer_dtype, 'int'),
+                ('onset_column', onset_column, pd.api.types.is_float_dtype, 'float')]
+
+        for attr, colname, typecheck, expected in cols:
+
+            if colname not in self.log.columns:
+                    
+                raise ValueError(
+                    f"Column '{colname}' not found in log. "
+                    f"Available columns: {list(self.log.columns)}"
+                )
+            
+            elif not typecheck(self.log[colname]):
+                
+                warnings.warn(
+                    f"Column '{colname}' has dtype {self.log[colname].dtype}, expected {expected}.",
+                    UserWarning,
+                )
+            
+            setattr(self, attr, colname)
 
 
     def update_log(self):
@@ -192,17 +233,10 @@ class RecordingHandler:
         ``trigger_events``, and resets the log index.
         """
         self.log_triggers = self.log[self.trigger_column].to_numpy()
-        self.log_times = self.log[self.time_column].to_numpy()
+        self.log_times = self.log[self.onset_column].to_numpy()
         self.unique_log_triggers = np.unique(self.log_triggers)
-        self.trigger_events = dict(
-            self.log[[self.trigger_column, self.eventcol]].drop_duplicates().values
-        )
+
         self.log = self.log.reset_index(drop=True)
-
-
-    def align_times(self):
-
-        pass
 
 
     def get_eeg_events(self, drop_initial_event=True, minlength=0, verbose=True):
@@ -370,7 +404,7 @@ class RecordingHandler:
         """Insert an event into both the log and the EEG trigger channel.
 
         Uses ``file_idcs`` if present in ``events``, otherwise falls back to
-        ``time_column``. Refreshes events via ``get_eeg_events`` afterwards.
+        ``onset_column``. Refreshes events via ``get_eeg_events`` afterwards.
 
         Args:
             indices (int or array-like): Log row position(s) for insertion.
@@ -381,16 +415,16 @@ class RecordingHandler:
         """
         if 'file_idcs' in events:
             self.insert_eeg_triggers(
-                events[self.triggercol],
+                events[self.trigger_column],
                 samples=events['file_idcs'],
                 trigger_span=trigger_span,
                 allow_overlap=allow_overlap,
             )
 
-        elif self.time_column in events:
+        elif self.onset_column in events:
             self.insert_eeg_triggers(
-                events[self.triggercol],
-                times=events[self.time_column],
+                events[self.trigger_column],
+                times=events[self.onset_column],
                 trigger_span=trigger_span,
                 allow_overlap=allow_overlap,
             )
@@ -432,10 +466,6 @@ class RecordingHandler:
         ch_idcs = [self._channels_loaded.index(ch) for ch in channels]
         self._data = np.delete(self._data, ch_idcs, axis=0)
         self._channels_loaded = np.delete(self._channels_loaded, ch_idcs).tolist()
-
-        self.ch_headers = [
-            ch for idx, ch in enumerate(self.ch_headers) if idx not in ch_idcs
-        ]
 
 
     def crop(self, start, stop, column, inplace=False):

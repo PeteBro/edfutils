@@ -1,5 +1,7 @@
-"""EEG session management with EDF/BDF I/O via pyedflib."""
+"""EEG recording management object with EDF/BDF I/O via pyedflib."""
 
+import os
+import copy
 import warnings
 
 import numpy as np
@@ -7,303 +9,260 @@ import pandas as pd
 import pyedflib
 from tqdm import tqdm
 
+class RecordingHandler:
+    """Manages EEG recordings in EDF/BDF format alongside a behavioural log.
 
-class SessionHandler:
-    """Manages EEG session data including trigger/event handling and EDF/BDF I/O.
+    Loads signal data via pyedflib and a CSV event log, aligns trigger codes
+    between the two, and supports cropping, insertion, and re-export.
 
-    Parameters
-    ----------
-    log : pd.DataFrame
-        Event log with at least trigger and event columns.
-    channels : np.ndarray
-        Channel data of shape (n_channels, n_samples).
-    channel_headers : list of dict
-        Per-channel metadata (pyedflib signal header format).
-    header : dict
-        File-level metadata (pyedflib header format).
-    trigger_ch_name : str
-        Label of the status/trigger channel.
-    convert_triggers : bool
-        If True, mask trigger channel to lower 16 bits on load (BDF encoding).
-    default_trigger : int
-        Value representing "no trigger" (baseline).
-    eventcol : str
-        Column name in log for event labels.
-    triggercol : str
-        Column name in log for trigger codes.
-    sfreq : int or None
-        Sampling frequency in Hz. Inferred from channel_headers if None.
-    drop_initial_event : bool
-        If True, replace repeated first-sample trigger value with default.
+    Attributes:
+        eeg_path (str): Absolute path to the EDF/BDF file.
+        log_path (str): Absolute path to the CSV log file.
+        log (pd.DataFrame): Behavioural event log.
+        trigger_column (str): Log column name containing trigger/event codes.
+        onset_column (str): Log column name containing event onset times.
+        sfreq (int): Sampling frequency in Hz.
+        dtype (np.dtype): Data type used for signal arrays.
+        filetype: pyedflib file type constant.
+        digital (bool): Whether signals are read as digital values.
+        bytemask (int): Bitmask used to decode/encode the trigger channel.
+        encodingdict (dict): Mapping of raw to decoded trigger values.
     """
 
-    def __init__(self, log, channels, channel_headers, header,
-                 trigger_ch_name='Status', convert_triggers=True,
-                 default_trigger=0, eventcol='event', triggercol='trigger',
-                 sfreq=None, drop_initial_event=True):
-
-        self.channels = channels
-        self.original_copy = channels.copy()
-        self.nsamples = channels.shape[-1]
-        self.ch_headers = list(channel_headers)
-        self.header = dict(header)
-        self.dtype = channels.dtype
-
-        self.trigger_ch_name = trigger_ch_name
-        self.get_channels()
-
-        self.trigger_channel = self.channels[self.trigger_ch_idx].copy().squeeze()
-        self.trigger_default = default_trigger
-        self.trigger_copy = self.trigger_channel.copy()
-        self.convert_triggers = convert_triggers
-
-        if self.convert_triggers:
-            self.trigger_channel = self.trigger_channel & 0xFFFF
-
-        self.encodingdict = dict(zip(self.trigger_channel, self.trigger_copy))
-
-        self.log = log.copy()
-        self.eventcol = eventcol
-        self.triggercol = triggercol
-
-        if sfreq is None:
-            sfreqs = {c['sample_frequency'] for c in channel_headers}
-            if len(sfreqs) == 1:
-                self.sfreq = int(list(sfreqs)[0])
-            else:
-                raise ValueError(
-                    'Inconsistent sample rates across channels; '
-                    'please specify sfreq explicitly.'
-                )
-        else:
-            self.sfreq = int(sfreq)
-
-        self.samples_to_time()
-        self.update_log()
-        self.get_events(verbose=True, drop_initial_event=drop_initial_event)
-
-    # ------------------------------------------------------------------ #
-    # Constructors / factories                                             #
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def from_edf(cls, path, log, trigger_ch_name='Status', convert_triggers=True,
-                 default_trigger=0, eventcol='event', triggercol='trigger',
-                 sfreq=None, drop_initial_event=True):
-        """Create a SessionHandler by reading an EDF/BDF file with pyedflib.
-
-        Parameters
-        ----------
-        path : str or path-like
-            Path to the EDF/BDF file.
-        log : pd.DataFrame
-            Event log (see class docstring).
-        trigger_ch_name, convert_triggers, default_trigger, eventcol,
-        triggercol, sfreq, drop_initial_event :
-            Forwarded to ``__init__``.
-
-        Returns
-        -------
-        SessionHandler
+    def __init__(self, eeg_path, log_path, trigger_channel_name='Status', trigger_column='trigger', onset_column='onset'):
         """
-        f = pyedflib.EdfReader(str(path))
-        try:
-            n = f.signals_in_file
-            channel_headers = [f.getSignalHeader(i) for i in range(n)]
-            header = f.getHeader()
-            n_samples = f.getNSamples()
-            max_samples = int(max(n_samples))
-            # Load as digital (integer) values so bit operations on the
-            # trigger/status channel are correct.
-            channels = np.zeros((n, max_samples), dtype=np.int32)
-            for i in range(n):
-                sig = f.readSignal(i, digital=True)
-                channels[i, :len(sig)] = sig
-            file_type = f.filetype
-        finally:
-            f.close()
-
-        obj = cls(log, channels, channel_headers, header,
-                  trigger_ch_name=trigger_ch_name,
-                  convert_triggers=convert_triggers,
-                  default_trigger=default_trigger,
-                  eventcol=eventcol,
-                  triggercol=triggercol,
-                  sfreq=sfreq,
-                  drop_initial_event=drop_initial_event)
-        obj._file_type = file_type
-        return obj
-
-    @classmethod
-    def merge_recordings(cls, raw_1, raw_2, header_1, header_2,
-                         channel_headers_1, channel_headers_2, log,
-                         **session_kwargs):
-        """Merge two raw recordings into one SessionHandler.
-
-        Inserts a silence span at the join point to account for any timing
-        gap between the two recordings as indicated by the event log.
-
-        Parameters
-        ----------
-        raw_1, raw_2 : np.ndarray
-            Channel arrays (n_channels, n_samples) for each recording.
-        header_1, header_2 : dict
-            File-level headers for each recording.
-        channel_headers_1, channel_headers_2 : list of dict
-            Per-channel headers for each recording.
-        log : pd.DataFrame
-            Combined event log for both recordings.
-        **session_kwargs
-            Additional kwargs forwarded to ``__init__``.
-
-        Returns
-        -------
-        SessionHandler
-            Merged session (not yet returned as raw data; call return_data()
-            or write_edf() when finished).
+        Args:
+            eeg_path (str): Path to the EDF/BDF recording file.
+            log_path (str): Path to the CSV behavioural log.
+            trigger_column (str): Log column containing trigger/event codes
+                (must be integer dtype).
+            onset_column (str): Log column containing event onset times in
+                seconds (must be float dtype).
         """
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            part_1 = cls(log, raw_1, channel_headers_1, header_1, **session_kwargs)
-            t1_idx = len(part_1.bdf_triggers) - 1
-            raw1_dur = len(part_1.trigger_channel) / part_1.sfreq
+        self.log_path = os.path.abspath(log_path)
+        self.eeg_path = os.path.abspath(eeg_path)
 
-            part_2 = cls(log, raw_2, channel_headers_2, header_2, **session_kwargs)
-            t2_idx = len(part_2.bdf_triggers)
+        self.read_log(self.log_path, trigger_column=trigger_column, onset_column=onset_column)
 
-        raw = np.concatenate([raw_1, raw_2], axis=1)
-        session = cls(log, raw, channel_headers_1, header_1, **session_kwargs)
+        self.reader = pyedflib.EdfReader(self.eeg_path)
 
-        t1 = session.bdf_trigger_samples[t1_idx][0] / session.sfreq
-        t2 = session.bdf_trigger_samples[-t2_idx][0] / session.sfreq
-        bdf_tdiff = t2 - t1
+        self._channels_loaded = []
+        self._data = []
 
-        l1 = session.log.iloc[t1_idx]['time']
-        l2 = session.log.iloc[-t2_idx]['time']
-        log_tdiff = l2 - l1
+        ######################################
+        self.dtype = np.int32
+        self.sfreq=2048
+        self.filetype = self.reader.filetype
+        self.digital = True
+        self._trigger_channel_name = trigger_channel_name
+        ######################################
 
-        time_to_add = log_tdiff - bdf_tdiff
-        session.insert_span(start=raw1_dur, stop=raw1_dur + time_to_add)
+        self.encodingdict = {}
 
-        session.update_log()
-        session.get_events()
-        return session
+        self.read_data(channels = [self._trigger_channel_name])
+        self.bytemask = self.get_bytemask(self._trigger_channel_name)
 
-    # ------------------------------------------------------------------ #
-    # EDF/BDF I/O                                                          #
-    # ------------------------------------------------------------------ #
+        if self.filetype == 'BDF':
+            self._data[self._trigger_idx] = self.decode_channels(self.trigger_channel)
 
-    def write_edf(self, path):
-        """Write session data to an EDF/BDF file using pyedflib.
+    ############
+    # Properties
+    ############
 
-        The trigger channel is re-encoded before writing.  The file type is
-        preserved from the source file when loaded via ``from_edf``; otherwise
-        ``pyedflib.FILETYPE_BDFPLUS`` is used as the default.
+    @property
+    def nsamples(self):
+        """int: Total number of samples in the recording (from channel 0)."""
+        return self.reader.samples_in_file(0)
 
-        Parameters
-        ----------
-        path : str or path-like
-            Destination file path.
+    @property
+    def channels(self):
+        """list[str]: All signal labels present in the EDF/BDF file."""
+        return self.reader.getSignalLabels()
+
+    @property
+    def datarecord_duration(self):
+        """float: Duration of one data record in seconds."""
+        return self.reader.datarecord_duration
+
+    @property
+    def trigger_channel(self):
+        """np.ndarray: The loaded trigger/status channel samples."""
+        return self._data[self._trigger_idx]
+
+    @property
+    def n_channels(self):
+        """int: Number of channels currently loaded into ``_data``."""
+        return len(self._data)
+
+    @property
+    def trigger_default(self):
+        """int: Most common value in the trigger channel (baseline/idle state)."""
+        return np.bincount(self.trigger_channel).argmax()
+
+    @property
+    def ch_headers(self):
+        """list[dict]: Signal headers for each loaded channel."""
+        return [self.reader.getSignalHeader(ch) for ch in self._channels_loaded]
+
+    @property
+    def header(self):
+        """dict: File-level header from the EDF/BDF reader."""
+        return self.reader.getHeader()
+
+    ##########################
+    # Simple reading functions
+    ##########################
+
+    def get_bytemask(self, channel):
+        """Compute a bitmask that isolates the trigger bits in a status channel.
+
+        Derives the mask from the channel's digital range and its most common
+        (baseline) value, so that ``data & bytemask`` strips the baseline bits.
+
+        Args:
+            channel (str): Name of the channel to compute the mask for.
+
+        Returns:
+            int: Bitmask with baseline bits cleared.
         """
-        header, ch_headers, channels, _ = self.return_data()
-        file_type = getattr(self, '_file_type', pyedflib.FILETYPE_BDFPLUS)
-        n_channels = channels.shape[0]
+        ch_idx = self._channels_loaded.index(channel)
+        header = self.ch_headers[ch_idx]
+        n_bits = int(np.log2(header['digital_max'] - header['digital_min'] + 1))
+        bit_cap = (1 << n_bits) - 1
+        ch_data = self._data[ch_idx]
+        baseline = np.bincount(ch_data).argmax()
+        return ~baseline & bit_cap
 
-        f = pyedflib.EdfWriter(str(path), n_channels, file_type=file_type)
-        try:
-            f.setHeader(header)
-            f.setSignalHeaders(ch_headers)
-            f.writeSamples([channels[i] for i in range(n_channels)])
-        finally:
-            f.close()
 
-    # ------------------------------------------------------------------ #
-    # Core internals                                                       #
-    # ------------------------------------------------------------------ #
+    def decode_channels(self, data):
+        """Apply the bytemask to strip baseline bits from trigger data.
 
-    def get_channels(self):
-        """Populate trigger channel index and channel name/index mappings."""
-        self.trigger_ch_idx = int(np.squeeze(
-            np.where([c['label'] == self.trigger_ch_name for c in self.ch_headers])
-        ))
-        self.channel_names = [c['label'] for c in self.ch_headers]
-        self.channel_idcs = {c['label']: idx for idx, c in enumerate(self.ch_headers)}
+        Also updates ``encodingdict`` with the raw-to-decoded mapping.
 
-    def samples_to_time(self, sfreq=None):
-        """Compute a time vector in seconds from sample indices."""
-        if sfreq is None:
-            sfreq = self.sfreq
-        self.time = np.arange(self.nsamples) / sfreq
+        Args:
+            data (np.ndarray): Raw digital trigger channel samples.
 
-    def update_log(self):
-        """Refresh cached trigger/event mappings derived from the log."""
-        self.log_triggers = self.log[self.triggercol].to_numpy()
-        self.trigger_mappings = dict(
-            self.log[[self.triggercol, self.eventcol]].drop_duplicates().values
-        )
-        self.trigger_mappings_inv = dict(
-            zip(self.trigger_mappings.values(), self.trigger_mappings.keys())
-        )
-        self.log.index = np.arange(len(self.log))
+        Returns:
+            np.ndarray: Decoded trigger samples.
+        """
+        decoded_data = data & self.bytemask
+        self.encodingdict.update(dict(zip(data, decoded_data)))
 
-    def return_data(self, infer_codec=True):
-        """Return (header, ch_headers, channels, log) ready for writing.
+        return decoded_data
 
-        If *infer_codec* is True, any trigger values missing from
-        ``encodingdict`` are estimated by linear extrapolation from existing
-        entries.
+
+    def read_data(self, channels=None):
+        """Read signal data from the EDF/BDF file into ``_data``.
+
+        Skips channels already loaded. After loading, re-sorts ``_data`` and
+        ``_channels_loaded`` to match the original file order.
 
         .. note::
-            This method modifies ``self.channels`` in-place to re-encode the
-            trigger channel, and drops ``'bdfidx'`` from ``self.log`` if
-            present.
+            ``_data`` is replaced on each call (via ``vstack``), invalidating
+            any previously cached views — always access ``trigger_channel``
+            through the property, never store it in a variable across calls.
+
+        Args:
+            channels (list[str], optional): Channel names to load. Defaults to
+                all channels in the file.
         """
-        if 'bdfidx' in self.log.columns:
-            self.log.drop(columns='bdfidx', inplace=True)
+        if channels is None:
+            channels = self.channels
+        ch_idcs = [self.channels.index(ch) for ch in channels]
+        for idx, ch in tqdm(zip(ch_idcs, channels), total=len(channels)):
+            
+            if ch in self._channels_loaded:
+                continue
+            else:
+                self._channels_loaded.append(ch)
+                new_row = self.reader.readSignal(idx, digital=self.digital).astype(self.dtype)
+            
+            if len(self._data) == 0:
+                self._data = new_row[None, :]
+            else:
+                self._data = np.vstack([self._data, new_row])
 
-        trigger_channel = self.trigger_channel.copy()
+        order = np.argsort([self.channels.index(ch) for ch in self._channels_loaded])
+        self._data = self._data[order]
+        self._channels_loaded = [self._channels_loaded[idx] for idx in order]
+        self._trigger_idx = self._channels_loaded.index(self._trigger_channel_name)
 
-        missing_triggers = set(np.unique(trigger_channel)) - set(self.encodingdict)
-        if infer_codec and missing_triggers:
-            x = np.asarray(list(self.encodingdict.keys()))
-            y = np.asarray(list(self.encodingdict.values()))
-            coefs = np.polyfit(x, y, 1)
-            poly = np.poly1d(coefs)
-            for t in missing_triggers:
-                self.encodingdict[t] = int(np.round(poly(t)))
 
-        if self.convert_triggers:
-            trigger_channel = self.encode_triggers_bdf(self.trigger_channel)
+    def read_log(self, log_path, trigger_column, onset_column):
+        """Load the behavioural log into ``self.log`` and validate key columns.
 
-        self.channels[self.trigger_ch_idx] = trigger_channel
+        The delimiter is detected automatically. Warns if a column name is not
+        provided or has an unexpected dtype; raises if the column is not found.
 
-        return self.header, self.ch_headers, self.channels, self.log
+        Args:
+            log_path (str): Path to the log file.
+            trigger_column (str): Column name for trigger/event codes.
+            onset_column (str): Column name for event onset times.
 
-    # ------------------------------------------------------------------ #
-    # Event management                                                     #
-    # ------------------------------------------------------------------ #
-
-    def get_events(self, drop_initial_event=True, minlength=0, verbose=True):
-        """Detect trigger events in the trigger channel and align with log.
-
-        Parameters
-        ----------
-        drop_initial_event : bool
-            Replace all occurrences of the first-sample trigger value with
-            ``trigger_default`` (removes DC-offset / baseline trigger runs).
-        minlength : int
-            Minimum run length in samples to count as a valid event.
-        verbose : bool
-            Print a summary of detected events.
+        Raises:
+            ValueError: If either column is not present in the log.
         """
+        self.log = pd.read_csv(log_path, sep=None, engine='python')
+
+        cols = [('trigger_column', trigger_column, pd.api.types.is_integer_dtype, 'int'),
+                ('onset_column', onset_column, pd.api.types.is_float_dtype, 'float')]
+
+        for attr, colname, typecheck, expected in cols:
+
+            if colname not in self.log.columns:
+                    
+                raise ValueError(
+                    f"Column '{colname}' not found in log. "
+                    f"Available columns: {list(self.log.columns)}"
+                )
+            
+            elif not typecheck(self.log[colname]):
+                
+                warnings.warn(
+                    f"Column '{colname}' has dtype {self.log[colname].dtype}, expected {expected}.",
+                    UserWarning,
+                )
+            
+            setattr(self, attr, colname)
+
+
+    def update_log(self):
+        """Refresh log-derived attributes from the current state of ``self.log``.
+
+        Updates ``log_triggers``, ``log_times``, ``unique_log_triggers``, and
+        ``trigger_events``, and resets the log index.
+        """
+        self.log_triggers = self.log[self.trigger_column].to_numpy()
+        self.log_times = self.log[self.onset_column].to_numpy()
+        self.unique_log_triggers = np.unique(self.log_triggers)
+
+        self.log = self.log.reset_index(drop=True)
+
+
+    def get_eeg_events(self, drop_initial_event=True, minlength=0, verbose=True):
+        """Extract trigger events from the EEG trigger channel and align with the log.
+
+        Populates ``bdf_trigger_samples``, ``bdf_triggers``, ``trigger_times``,
+        and ``unique_eeg_triggers``. If the log and EEG triggers match,
+        ``file_idcs`` is added to ``self.log``. Warns on count or code mismatches.
+
+        Args:
+            drop_initial_event (bool): If True, replace the first trigger value
+                (typically a recording-start artefact) with the baseline.
+            minlength (int): Minimum run length (in samples) for a trigger to
+                be included.
+            verbose (bool): If True, print a summary of found events.
+        """
+        self.update_log()
+
         if drop_initial_event:
             first_val = self.trigger_channel[0]
             self.trigger_channel[self.trigger_channel == first_val] = self.trigger_default
 
-        self.unique_triggers = np.unique(self.trigger_channel)
-        self.unique_triggers = np.delete(
-            self.unique_triggers,
-            np.where(self.unique_triggers == self.trigger_default),
+        self.unique_eeg_triggers = np.unique(self.trigger_channel)
+        self.unique_eeg_triggers = np.delete(
+            self.unique_eeg_triggers,
+            np.where(self.unique_eeg_triggers == self.trigger_default),
         )
 
         mask = self.trigger_channel > 0
@@ -318,133 +277,80 @@ class SessionHandler:
         self.trigger_times = np.asarray([
             t[0] / self.sfreq for t in self.bdf_trigger_samples
         ])
-
+        
         if verbose:
             print(
-                f'Found {len(self.bdf_triggers)} events '
-                f'with unique triggers: {self.unique_triggers}.'
+                f'Found {len(self.bdf_triggers)} events in data file'
+                f'with unique triggers: {self.unique_eeg_triggers}.'
             )
 
         if len(self.log_triggers) != len(self.bdf_triggers):
             warnings.warn(
                 'Uneven number of events in log and BDF file; '
-                'risk of timing discrepancies. Please inspect before proceeding.',
+                'risk of timing discrepancies. Please run diagnostics before proceeding.',
                 RuntimeWarning,
             )
-        elif np.all(self.log_triggers == self.bdf_triggers):
-            self.log['bdfidx'] = self.bdf_trigger_samples
-        else:
+
+        elif not np.all(self.log_triggers == self.bdf_triggers):
             warnings.warn(
                 'Log and BDF trigger codes do not match; '
-                'risk of timing discrepancies. Please inspect before proceeding.',
+                'risk of timing discrepancies. Please run diagnostics before proceeding.',
                 RuntimeWarning,
             )
 
-    def find_event(self, lookup, mode='or', asint=True):
-        """Find log row indices matching the given column/value lookup.
-
-        Parameters
-        ----------
-        lookup : dict
-            Mapping of ``{column_name: list_of_values}``.
-        mode : {'or', 'and'}
-            How to combine multi-column lookups.
-        asint : bool
-            Return integer index array (True) or boolean mask (False).
-        """
-        masks = [np.isin(self.log[col], vals) for col, vals in lookup.items()]
-        combined = (
-            np.logical_or.reduce(masks) if mode == 'or'
-            else np.logical_and.reduce(masks)
-        )
-        return np.where(combined)[0] if asint else combined
-
-    def modify_event(self, indices=None, replacements=None):
-        """Delete or relabel events at the given log indices.
-
-        Parameters
-        ----------
-        indices : array-like of int
-            Log row indices to modify.
-        replacements : dict or None
-            If None, delete the events.  Otherwise a dict mapping
-            ``column_name → new_values`` applied to those rows.
-        """
-        if len(indices) == 0:
-            return
-
-        bdfidcs = self.log.loc[indices, 'bdfidx'].to_list()
-        idcsflat = np.concatenate(bdfidcs)
-
-        if replacements is None:
-            self.log.drop(indices, inplace=True)
-            self.log.index = np.arange(len(self.log))
-            self.trigger_channel[idcsflat] = self.trigger_default
         else:
-            for key, val in replacements.items():
-                self.log.loc[indices, key] = pd.Series(val, index=indices)
-                if key == self.triggercol:
-                    repeat_counts = np.array([len(lst) for lst in bdfidcs])
-                    if isinstance(val, (np.ndarray, list)):
-                        val = np.repeat(val, repeat_counts)
-                    self.trigger_channel[idcsflat] = val
+            self.log['file_idcs'] = self.bdf_trigger_samples
 
-        self.update_log()
-        self.get_events(verbose=False)
+    #############################################
+    # Data exploration and modification functions
+    #############################################
 
-    def insert_event(self, indices, events, trigger_span=15, allow_overlap=False):
-        """Insert new events into the log and trigger channel.
+    def find_event(self, lookup, mode='or', asint=True):
+        """Find log row indices matching a set of column-value filters.
 
-        Parameters
-        ----------
-        indices : array-like of int
-            Log positions at which to insert.
-        events : dict
-            Event definition with keys matching log columns; must include
-            either ``'bdfidx'`` or ``'onset'`` to locate the trigger.
-        trigger_span : int
-            Trigger pulse width in samples.
-        allow_overlap : bool
-            Whether to allow inserting over existing triggers.
+        Args:
+            lookup (dict): Mapping of column name to value or list of values.
+            mode (str): ``'or'`` to match any filter, ``'and'`` to match all.
+            asint (bool): If True, return integer indices; otherwise return a
+                boolean mask.
+
+        Returns:
+            np.ndarray: Matching row indices or boolean mask.
         """
-        if 'bdfidx' in events:
-            self.insert_triggers_bdf(
-                events[self.triggercol],
-                samples=events['bdfidx'],
-                trigger_span=trigger_span,
-                allow_overlap=allow_overlap,
-            )
-        elif 'onset' in events:
-            self.insert_triggers_bdf(
-                events[self.triggercol],
-                times=events['onset'],
-                trigger_span=trigger_span,
-                allow_overlap=allow_overlap,
-            )
+        mask = pd.DataFrame(np.full(self.log.shape, True),
+                            columns = self.log.columns)
+        
+        for key, vals in lookup.items():
+            if not(isinstance(vals, (list, tuple))):
+                vals = [vals]
+            mask[key] &= self.log[key].isin(vals)
 
-        self.insert_event_log(indices, events)
-        self.get_events(verbose=False)
+        mask = mask.to_numpy()
+        if mode == 'or':
+            mask = np.any(mask, axis=1)
+        elif mode == 'and':
+            mask = np.all(mask, axis=1)
 
-    def insert_event_log(self, indices, events):
-        """Insert rows into the event log at the specified positions.
+        return np.where(mask)[0] if asint else mask
 
-        Parameters
-        ----------
-        indices : array-like of int
-            Positions in the current log at which to insert rows.
-        events : dict
-            Column → value mapping for the new rows.  Missing columns are
-            filled with NaN.
+
+    def insert_log_event(self, indices, events):
+        """Insert one or more rows into the event log at the given indices.
+
+        Missing columns are filled with NaN. Calls ``update_log`` afterwards.
+
+        Args:
+            indices (int or array-like): Row position(s) at which to insert.
+            events (dict or pd.DataFrame): Event data to insert.
         """
-        if isinstance(events, pd.DataFrame):
-            events = dict(events)
+        if isinstance(events, dict):
+            events = pd.DataFrame(events)
 
-        insert = {
-            col: (events[col] if col in events else np.full(len(indices), np.nan))
-            for col in self.log.columns
-        }
+        for column in self.log.columns:
+            if column not in events.columns:
+                events[column] = np.nan
 
-        insert_arr = pd.DataFrame(insert).to_numpy()
+        insert_arr = pd.DataFrame(events).to_numpy()
         lognp = self.log.to_numpy()
         self.log = pd.DataFrame(
             np.insert(lognp, indices, insert_arr, axis=0),
@@ -452,23 +358,27 @@ class SessionHandler:
         )
         self.update_log()
 
-    def insert_triggers_bdf(self, triggers, times=None, samples=None,
-                            trigger_span=15, allow_overlap=False):
-        """Write trigger codes into the trigger channel.
 
-        Parameters
-        ----------
-        triggers : array-like
-            Trigger code(s) to insert.
-        times : array-like of float, optional
-            Onset times in seconds (converted to samples via ``sfreq``).
-        samples : array-like of int or list of arrays, optional
-            Sample indices.  Scalars are expanded to ``trigger_span``-length
-            pulses; pre-built index arrays are used as-is.
-        trigger_span : int
-            Pulse width in samples when *samples* contains scalar start points.
-        allow_overlap : bool
-            If False, raise an error when existing triggers would be overwritten.
+    def insert_eeg_triggers(self, triggers, times=None, samples=None,
+                            trigger_span=15, allow_overlap=False):
+        """Write trigger codes directly into the EEG trigger channel.
+
+        Either ``times`` or ``samples`` must be provided. Scalar sample values
+        are expanded into spans of ``trigger_span`` samples.
+
+        Args:
+            triggers (list): Trigger code(s) to write.
+            times (array-like, optional): Event onset times in seconds.
+            samples (array-like, optional): Event onset sample indices (or
+                pre-built arrays of sample indices per event).
+            trigger_span (int): Number of samples each trigger occupies when
+                expanding scalar sample positions.
+            allow_overlap (bool): If False, raises ValueError if any target
+                samples already contain a known trigger code.
+
+        Raises:
+            ValueError: If ``allow_overlap`` is False and triggers already
+                exist at the requested positions.
         """
         if samples is None:
             samples = np.round(self.sfreq * np.asarray(times)).astype(int)
@@ -483,80 +393,97 @@ class SessionHandler:
         triggers_flat = np.concatenate(triggers)
 
         if not allow_overlap and np.any(
-            np.isin(self.trigger_channel[samples_flat], self.unique_triggers)
+            np.isin(self.trigger_channel[samples_flat], self.unique_eeg_triggers)
         ):
             raise ValueError('Triggers already exist at the requested time points.')
 
         self.trigger_channel[samples_flat] = triggers_flat
 
-    def insert_span(self, start, stop=None, length=None, value=0):
-        """Insert a silent span (constant value) into channels and trigger.
 
-        Parameters
-        ----------
-        start : float
-            Insertion point in seconds.
-        stop : float, optional
-            End of the span in seconds (used to derive *length* if not given).
-        length : int, optional
-            Span length in samples.  Derived from ``stop - start`` if None.
-        value : numeric
-            Fill value for the new span.
+    def insert_event(self, indices, events, trigger_span=15, allow_overlap=False):
+        """Insert an event into both the log and the EEG trigger channel.
+
+        Uses ``file_idcs`` if present in ``events``, otherwise falls back to
+        ``onset_column``. Refreshes events via ``get_eeg_events`` afterwards.
+
+        Args:
+            indices (int or array-like): Log row position(s) for insertion.
+            events (dict or pd.DataFrame): Event data; must include trigger and
+                timing information.
+            trigger_span (int): Passed to ``insert_eeg_triggers``.
+            allow_overlap (bool): Passed to ``insert_eeg_triggers``.
+        """
+        if 'file_idcs' in events:
+            self.insert_eeg_triggers(
+                events[self.trigger_column],
+                samples=events['file_idcs'],
+                trigger_span=trigger_span,
+                allow_overlap=allow_overlap,
+            )
+
+        elif self.onset_column in events:
+            self.insert_eeg_triggers(
+                events[self.trigger_column],
+                times=events[self.onset_column],
+                trigger_span=trigger_span,
+                allow_overlap=allow_overlap,
+            )
+
+        self.insert_log_event(indices, events)
+        self.get_eeg_events(verbose=False)
+
+
+    def insert_span(self, start, stop=None, length=None, value=0):
+        """Insert a constant-value span of samples into the signal data.
+
+        Args:
+            start (float): Insertion point in seconds.
+            stop (float, optional): End of the span in seconds. Used to derive
+                ``length`` if not provided directly.
+            length (int, optional): Number of samples to insert.
+            value (int): Fill value for the inserted samples.
         """
         if length is None:
             length = int((stop - start) * self.sfreq)
 
         start_sample = int(start * self.sfreq)
 
-        span = np.full((self.channels.shape[0], length), value, dtype=self.dtype)
-        self.channels = np.concatenate(
-            [self.channels[:, :start_sample], span, self.channels[:, start_sample:]],
+        span = np.full((self._data.shape[0], length), value, dtype=self.dtype)
+        self._data = np.concatenate(
+            [self._data[:, :start_sample], span, self._data[:, start_sample:]],
             axis=1,
         )
 
-        trigspan = np.full(length, value)
-        self.trigger_channel = np.concatenate([
-            self.trigger_channel[:start_sample],
-            trigspan,
-            self.trigger_channel[start_sample:],
-        ])
+        self.get_eeg_events(verbose=False)
 
-        self.get_events(verbose=False)
-        self.update_log()
-
-    # ------------------------------------------------------------------ #
-    # Channel management                                                   #
-    # ------------------------------------------------------------------ #
-
+    
     def drop_channels(self, channels):
-        """Remove channels by name.
+        """Remove channels from the loaded data.
 
-        Parameters
-        ----------
-        channels : list of str
-            Channel labels to remove.
+        Args:
+            channels (list[str]): Names of channels to drop.
         """
-        ch_idcs = [self.channel_idcs[ch] for ch in channels]
-        self.channels = np.delete(self.channels, ch_idcs, axis=0)
-        self.ch_headers = [
-            ch for idx, ch in enumerate(self.ch_headers) if idx not in ch_idcs
-        ]
-        self.get_channels()
+        ch_idcs = [self._channels_loaded.index(ch) for ch in channels]
+        self._data = np.delete(self._data, ch_idcs, axis=0)
+        self._channels_loaded = np.delete(self._channels_loaded, ch_idcs).tolist()
 
-    def crop_events(self, start, stop, column, inplace=False):
-        """Crop the session to the time window surrounding events in *column*.
 
-        Parameters
-        ----------
-        start : numeric
-            Lower bound of the *column* range to keep.
-        stop : numeric
-            Upper bound of the *column* range to keep.
-        column : str
-            Log column to filter on.
-        inplace : bool
-            If True, modify self in-place; if False, return a new
-            SessionHandler.
+    def crop(self, start, stop, column, inplace=False):
+        """Crop the recording to a range of values in a log column.
+
+        Selects log rows where ``column`` is between ``start`` and ``stop``,
+        then slices ``_data`` to the corresponding sample range (with padding
+        to cover the full requested interval).
+
+        Args:
+            start: Lower bound of the column range (inclusive).
+            stop: Upper bound of the column range (inclusive).
+            column (str): Log column to filter on.
+            inplace (bool): If True, modify this object; otherwise return a
+                deep copy with the cropped data.
+
+        Returns:
+            RecordingHandler or None: Cropped copy if ``inplace=False``.
         """
         query = self.log[column].to_numpy()
         indices = np.where(np.logical_and(query >= start, query <= stop))[0]
@@ -565,156 +492,97 @@ class SessionHandler:
         start_diff = cropped_log[column].to_numpy()[0] - start
         stop_diff = stop - cropped_log[column].to_numpy()[-1]
 
-        bdfspan = np.concatenate(cropped_log['bdfidx'].to_list())
+        bdfspan = np.concatenate(cropped_log['file_idcs'].to_list())
         bdfstart = bdfspan[0] - int(start_diff * self.sfreq)
         bdfstop = bdfspan[-1] + int(stop_diff * self.sfreq)
 
-        copytrigger = self.trigger_channel.copy()
-        copytrigger[:bdfspan[0]] = self.trigger_default
-        copytrigger[bdfspan[-1] + 1:] = self.trigger_default
-
-        cropped_channels = self.channels[:, bdfstart:bdfstop].copy()
-        cropped_triggers = copytrigger[bdfstart:bdfstop]
+        cropped_channels = self._data[:, bdfstart:bdfstop].copy()
 
         if inplace:
-            self.channels = cropped_channels
+            self._data = cropped_channels
             self.log = cropped_log
-            self.update_log()
-            self.get_events()
-        else:
-            if self.convert_triggers:
-                cropped_triggers = self.encode_triggers_bdf(cropped_triggers)
+            self.get_eeg_events()
 
-            cropped_channels[self.trigger_ch_idx] = cropped_triggers
-            cropped_log = cropped_log.drop(columns='bdfidx')
+        else:                                                                                                                                                                   
+            new = copy.deepcopy(self)                                                                                                                                                                 
+            new._data = cropped_channels
+            new.log = cropped_log
+            new.get_eeg_events()
+            return new
+        
+    #################################
+    # Diagnostic and repair functions
+    #################################
 
-            return self.__class__(
-                cropped_log,
-                cropped_channels,
-                self.ch_headers,
-                self.header,
-                trigger_ch_name=self.trigger_ch_name,
-                convert_triggers=self.convert_triggers,
-                default_trigger=self.trigger_default,
-                eventcol=self.eventcol,
-                triggercol=self.triggercol,
-                drop_initial_event=False,
-            )
+    def run_diagnostic(self):
 
-    # ------------------------------------------------------------------ #
-    # Trigger encoding                                                     #
-    # ------------------------------------------------------------------ #
+        pass
 
-    def encode_triggers_bdf(self, triggers):
-        """Re-encode trigger values into the original BDF integer format.
+    ########################
+    # Data writing functions
+    ########################
 
-        Upper 16 bits come from ``encodingdict``; lower 16 bits carry the
-        decoded trigger code.
+
+    def encode_channels(self, data):
+        """Re-encode decoded trigger data by restoring the baseline bits.
+
+        Inverse of ``decode_channels``: ORs the data with the inverted bytemask
+        to reinstate the bits that were stripped on read.
+
+        Args:
+            data (np.ndarray): Decoded trigger channel samples.
+
+        Returns:
+            np.ndarray: Re-encoded trigger samples ready for writing.
         """
-        encoded = np.asarray([self.encodingdict[t] for t in triggers])
-        result = (
-            encoded.astype(np.uint32) & 0xFFFF0000
-            | triggers.astype(np.uint32) & 0x0000FFFF
-        )
-        return result.astype(np.int32)
+        return (data | (~self.bytemask & 0xFFFFFF)).astype(self.dtype)
 
-    # ------------------------------------------------------------------ #
-    # Repair methods (originally repair_funcs.py)                         #
-    # ------------------------------------------------------------------ #
+    
+    def fill_datarecords(self):
+        """Pad ``_data`` with zeros so its length is a multiple of the data record size.
 
-    def repair_aberrant_trigger(self, maxlen):
-        """Replace aberrant triggers shorter than *maxlen* samples.
-
-        Aberrant pulses are replaced by their neighbouring trigger code when
-        adjacent, or by ``trigger_default`` otherwise.
-
-        Parameters
-        ----------
-        maxlen : int
-            Minimum trigger pulse length in samples; shorter pulses are
-            considered aberrant.
+        Required before writing, as EDF/BDF files must contain whole records.
         """
-        n = len(self.bdf_trigger_samples)
-        for idx, t in enumerate(self.bdf_trigger_samples):
-            if len(t) < maxlen:
-                if idx > 0 and np.any(np.isin(t - 1, self.bdf_trigger_samples[idx - 1])):
-                    replacement = self.bdf_triggers[idx - 1]
-                elif idx < n - 1 and np.any(
-                    np.isin(t + 1, self.bdf_trigger_samples[idx + 1])
-                ):
-                    replacement = self.bdf_triggers[idx + 1]
-                else:
-                    replacement = self.trigger_default
-                self.trigger_channel[t] = replacement
-        self.get_events()
+        remainder = self._data.shape[-1] % (self.datarecord_duration*self.sfreq)
+        if remainder:
+            filler = np.zeros((self._data.shape[0], int(self.sfreq-remainder))).astype(self.dtype)
+            self._data = np.concatenate([self._data, filler], axis=1)
+    
 
-    def fix_false_starts(self):
-        """Trim false-start events from the log and trigger channel.
+    def write_log(self, path, **kwargs):
+        """Write the event log to a CSV file.
 
-        Finds the last occurrence of trigger code 1 in the log and discards
-        everything before it, zeroing the corresponding trigger channel samples.
+        Args:
+            path (str): Destination file path.
+            **kwargs: Additional arguments passed to ``pd.DataFrame.to_csv``.
         """
-        starts_log = self.find_event({self.triggercol: [1]})
-        self.log = self.log.iloc[starts_log[-1]:]
-        self.update_log()
+        self.log.to_csv(path, **kwargs)
 
-        starts_bdf = np.where(self.bdf_triggers == 1)[0]
-        if len(starts_bdf) > 1:
-            sample = self.bdf_trigger_samples[starts_bdf[-1] - 1][-1]
-            self.trigger_channel[:sample + 1] = 0
 
-        self.get_events()
+    def write_data(self, path, verbose=True):
+        """Write the loaded signal data to an EDF/BDF file.
 
-    def insert_missing_bdf(self):
-        """Interpolate and insert BDF triggers that are in the log but absent
-        from the recording, using log timing as a reference.
+        Re-encodes the trigger channel for BDF files before writing. Data is
+        written in whole data records via ``blockWriteDigitalSamples``.
 
-        Raises
-        ------
-        AssertionError
-            If the last log trigger does not match the last BDF trigger.
-        RuntimeError
-            If the algorithm fails to converge within the expected number of
-            iterations.
+        Args:
+            path (str): Destination file path. May be the same as ``eeg_path``
+                for in-place writes.
+            verbose (bool): If True, show a tqdm progress bar.
         """
-        assert (
-            self.log[self.triggercol].to_numpy()[-1] == self.bdf_triggers[-1]
-        ), 'Last log trigger does not match last BDF trigger.'
+        if self.filetype == 'BDF':
+            self._data[self._trigger_idx] = self.encode_channels(self.trigger_channel)
 
-        loglen = self.log.iloc[-1]['time'] - self.log.iloc[0]['time']
-        bdflen = self.trigger_times[-1] - self.trigger_times[0]
+        writer = pyedflib.EdfWriter(path, self.n_channels, file_type=self.filetype)
+        
+        writer.setHeader(self.header)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            writer.setSignalHeaders(self.ch_headers)
+        
+        ndatarecords = self._data.shape[-1] // int(self.datarecord_duration*self.sfreq)
+        data = np.split(self._data, ndatarecords, axis=1)
+        for record in tqdm(data, desc='Writing data records', disable=not verbose):
+            _ = writer.blockWriteDigitalSamples(record.flatten())        
+        writer.close()
 
-        if loglen > bdflen:
-            self.insert_span(start=0, stop=(loglen - bdflen) + 100)
-            self.get_events()
-
-        trig_diff = len(self.log) - len(self.bdf_triggers)
-        print(f'Detected {trig_diff} missing triggers.')
-        counter = tqdm(range(trig_diff), desc='Interpolating triggers')
-
-        attempts = 0
-        while len(self.log) != len(self.bdf_triggers):
-            if attempts > len(self.log) + 1000:
-                raise RuntimeError(
-                    'Maximum attempts exceeded while inserting missing triggers.'
-                )
-
-            for idx, row in self.log.iterrows():
-                if self.bdf_triggers[idx] != row[self.triggercol]:
-                    tdiff = self.log.iloc[-1]['time'] - row['time']
-                    samples = self.bdf_trigger_samples[-1] - int(self.sfreq * tdiff)
-                    self.insert_triggers_bdf(
-                        triggers=[row[self.triggercol]], samples=[samples]
-                    )
-                    attempts = 0
-                    self.update_log()
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore')
-                        self.get_events(verbose=False)
-                    counter.update()
-                    break
-
-            attempts += 1
-
-        self.update_log()
-        self.get_events()
