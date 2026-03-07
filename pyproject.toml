@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "edfutils"
+version = "0.1.0"
+description = "EDF/BDF recording management with behavioural log alignment"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyedflib",
+    "tqdm",
+]
