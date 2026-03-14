@@ -2,6 +2,7 @@
 
 import copy
 import warnings
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -25,9 +26,9 @@ class _EditingMixin:
     def get_eeg_events(self, drop_initial_event=True, minlength=0, verbose=True):
         """Extract trigger events from the EEG trigger channel and align with the log.
 
-        Populates ``bdf_trigger_samples``, ``bdf_triggers``, ``trigger_times``,
+        Populates ``eeg_trigger_samples``, ``eeg_triggers``, ``trigger_times``,
         and ``unique_eeg_triggers``. If the log and EEG triggers match,
-        ``file_idcs`` is added to ``self.log``. Warns on count or code mismatches.
+        ``trigger_idcs`` is added to ``self.log``. Warns on count or code mismatches.
 
         Args:
             drop_initial_event (bool): If True, replace the first trigger value
@@ -51,30 +52,30 @@ class _EditingMixin:
         mask = self.trigger_channel > 0
         boundaries = np.flatnonzero(np.diff(self.trigger_channel) != 0) + 1
         runs = np.split(np.arange(self.trigger_channel.size), boundaries)
-        self.bdf_trigger_samples = [
+        self.eeg_trigger_samples = [
             r for r in runs if mask[r[0]] and len(r) > minlength
         ]
-        self.bdf_triggers = np.concatenate([
-            np.unique(self.trigger_channel[e]) for e in self.bdf_trigger_samples
+        self.eeg_triggers = np.concatenate([
+            np.unique(self.trigger_channel[e]) for e in self.eeg_trigger_samples
         ])
         self.trigger_times = np.asarray([
-            t[0] / self.sfreq for t in self.bdf_trigger_samples
+            t[0] / self.sfreq for t in self.eeg_trigger_samples
         ])
 
         if verbose:
             print(
-                f'Found {len(self.bdf_triggers)} events in data file '
+                f'Found {len(self.eeg_triggers)} events in data file '
                 f'with unique triggers: {self.unique_eeg_triggers}.'
             )
 
-        if len(self.log_triggers) != len(self.bdf_triggers):
+        if len(self.log_triggers) != len(self.eeg_triggers):
             warnings.warn(
                 'Uneven number of events in log and BDF file; '
                 'risk of timing discrepancies. Please run diagnostics before proceeding.',
                 RuntimeWarning,
             )
 
-        elif not np.all(self.log_triggers == self.bdf_triggers):
+        elif not np.all(self.log_triggers == self.eeg_triggers):
             warnings.warn(
                 'Log and BDF trigger codes do not match; '
                 'risk of timing discrepancies. Please run diagnostics before proceeding.',
@@ -82,10 +83,10 @@ class _EditingMixin:
             )
 
         else:
-            self.log['file_idcs'] = self.bdf_trigger_samples
+            self.log['trigger_idcs'] = self.eeg_trigger_samples
 
 
-    def find_event(self, lookup, mode='or', asint=True):
+    def find_event(self, lookup, mode='and', asint=True):
         """Find log row indices matching a set of column-value filters.
 
         Args:
@@ -97,15 +98,15 @@ class _EditingMixin:
         Returns:
             np.ndarray: Matching row indices or boolean mask.
         """
-        mask = pd.DataFrame(np.full(self.log.shape, True),
-                            columns=self.log.columns)
+        mask = defaultdict(list)
 
         for key, vals in lookup.items():
             if not isinstance(vals, (list, tuple)):
                 vals = [vals]
-            mask[key] &= self.log[key].isin(vals)
+            mask[key] = self.log[key].isin(vals).to_list()
 
-        mask = mask.to_numpy()
+        mask = pd.DataFrame(mask).to_numpy()
+
         if mode == 'or':
             mask = np.any(mask, axis=1)
         elif mode == 'and':
@@ -114,7 +115,7 @@ class _EditingMixin:
         return np.where(mask)[0] if asint else mask
 
 
-    def insert_log_event(self, indices, events):
+    def _insert_log_event(self, indices, events):
         """Insert one or more rows into the event log at the given indices.
 
         Missing columns are filled with NaN. Calls ``update_log`` afterwards.
@@ -129,6 +130,8 @@ class _EditingMixin:
         for column in self.log.columns:
             if column not in events.columns:
                 events[column] = np.nan
+        
+        events = events[self.log.columns]
 
         insert_arr = pd.DataFrame(events).to_numpy()
         lognp = self.log.to_numpy()
@@ -139,7 +142,7 @@ class _EditingMixin:
         self.update_log()
 
 
-    def insert_eeg_triggers(self, triggers, times=None, samples=None,
+    def _insert_eeg_triggers(self, triggers, times=None, samples=None,
                             trigger_span=15, allow_overlap=False):
         """Write trigger codes directly into the EEG trigger channel.
 
@@ -180,36 +183,41 @@ class _EditingMixin:
         self.trigger_channel[samples_flat] = triggers_flat
 
 
-    def insert_event(self, indices, events, trigger_span=15, allow_overlap=False):
-        """Insert an event into both the log and the EEG trigger channel.
+    def insert_event(self, events, trigger_span=15, allow_overlap=False):
+        """Insert one or more events into the recording.
 
-        Uses ``file_idcs`` if present in ``events``, otherwise falls back to
-        ``onset_column``. Refreshes events via ``get_eeg_events`` afterwards.
+        Adds the events to the log and writes the corresponding trigger codes
+        into the EEG data at the correct time points.
 
         Args:
-            indices (int or array-like): Log row position(s) for insertion.
-            events (dict or pd.DataFrame): Event data; must include trigger and
-                timing information.
-            trigger_span (int): Passed to ``insert_eeg_triggers``.
-            allow_overlap (bool): Passed to ``insert_eeg_triggers``.
+            events (dict or pd.DataFrame): Event data; must include onset
+                times and trigger codes.
+            trigger_span (int): Duration of each trigger code in samples.
+            allow_overlap (bool): If False, raises an error if triggers already
+                exist at the target time points.
         """
-        if 'file_idcs' in events:
-            self.insert_eeg_triggers(
-                events[self.trigger_column],
-                samples=events['file_idcs'],
-                trigger_span=trigger_span,
-                allow_overlap=allow_overlap,
-            )
 
-        elif self.onset_column in events:
-            self.insert_eeg_triggers(
-                events[self.trigger_column],
-                times=events[self.onset_column],
-                trigger_span=trigger_span,
-                allow_overlap=allow_overlap,
-            )
+        if isinstance(events, dict):
+            events = pd.DataFrame(events)
 
-        self.insert_log_event(indices, events)
+        times = events[self.onset_column].to_numpy()
+        indices = np.searchsorted(self.log.onset.to_numpy(), times)
+        self._insert_log_event(indices, events)
+        
+        last_event = np.max(np.where(~self.log['trigger_idcs'].isna()))
+        last_event = self.log.iloc[last_event]
+        tdiffs = [last_event.onset - self.log.iloc[idx].onset for idx in indices]
+
+        ref_samples = np.asarray(last_event.trigger_idcs)
+        insert_samples = [ref_samples -  int(tdiff*self.sfreq) for tdiff in tdiffs]        
+
+        self._insert_eeg_triggers(
+            list(events[self.trigger_column]),
+            samples=insert_samples,
+            trigger_span=trigger_span,
+            allow_overlap=allow_overlap,
+        )
+        
         self.get_eeg_events(verbose=False)
 
 
@@ -247,31 +255,42 @@ class _EditingMixin:
             self.channel.drop(ch)
 
 
-    def crop(self, start, stop, column, inplace=False):
-        """Crop the recording to a range of values in a log column.
+    def crop(self, start=None, stop=None, tmin=None, tmax=None, inplace=False):
+        """Crop the recording to a time window or log row range.
 
-        Selects log rows where ``column`` is between ``start`` and ``stop``,
-        then slices ``_data`` to the corresponding sample range (with padding
-        to cover the full requested interval).
+        Two modes are supported:
+
+        - **Time-based** (``tmin``/``tmax``): selects log rows whose onset
+          falls within ``[tmin, tmax]`` and pads the data slice to cover the
+          full requested interval.
+        - **Index-based** (``start``/``stop``): selects log rows
+          ``start:stop`` with no padding.
 
         Args:
-            start: Lower bound of the column range (inclusive).
-            stop: Upper bound of the column range (inclusive).
-            column (str): Log column to filter on.
-            inplace (bool): If True, modify this object; otherwise return a
-                deep copy with the cropped data.
+            start (int, optional): Start log row index (index-based mode).
+            stop (int, optional): Stop log row index, exclusive (index-based mode).
+            tmin (float, optional): Start time in seconds (time-based mode).
+            tmax (float, optional): Stop time in seconds (time-based mode).
+            inplace (bool): If True, modify this object in place; otherwise
+                return a deep copy with the cropped data.
 
         Returns:
-            EEGSession or None: Cropped copy if ``inplace=False``.
+            EEGSession or None: Cropped copy if ``inplace=False``, else None.
         """
-        query = self.log[column].to_numpy()
-        indices = np.where(np.logical_and(query >= start, query <= stop))[0]
+
+        if tmin is not None and tmax is not None:
+            query = self.log[self.onset_column].to_numpy()
+            indices = np.where((query >= tmin) & (query <= tmax))[0]
+            onset_times = self.log.loc[indices, self.onset_column].to_numpy()
+            start_diff = onset_times[0] - tmin
+            stop_diff = tmax - onset_times[-1]
+        else:
+            indices = np.arange(start, stop)
+            start_diff = stop_diff = 0
+
         cropped_log = self.log.loc[indices].copy()
 
-        start_diff = cropped_log[column].to_numpy()[0] - start
-        stop_diff = stop - cropped_log[column].to_numpy()[-1]
-
-        bdfspan = np.concatenate(cropped_log['file_idcs'].to_list())
+        bdfspan = np.concatenate(cropped_log['trigger_idcs'].to_list())
         bdfstart = bdfspan[0] - int(start_diff * self.sfreq)
         bdfstop = bdfspan[-1] + int(stop_diff * self.sfreq)
 

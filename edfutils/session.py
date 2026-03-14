@@ -59,7 +59,7 @@ class EEGSession(_IOMixin, _EditingMixin):
         self.digital = digital
         self._trigger_channel_name = trigger_channel_name
 
-        self.read_data(channels=[self._trigger_channel_name])
+        self.read_data(channels=[self._trigger_channel_name], verbose=False)
         self._data[self._trigger_idx] = self.channel.decode(self._trigger_channel_name)
 
     ############

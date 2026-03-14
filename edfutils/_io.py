@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 class _IOMixin:
 
-    def read_data(self, channels=None):
+    def read_data(self, channels=None, verbose=True):
         """Read signal data from the EDF/BDF file into ``_data``.
 
         Skips channels already loaded. After loading, re-sorts ``_data`` and
@@ -28,7 +28,7 @@ class _IOMixin:
         if channels is None:
             channels = self.channels
 
-        for ch in tqdm(channels, total=len(channels)):
+        for ch in tqdm(channels, total=len(channels), disable=not verbose):
             if self.channel.loaded(ch):
                 continue
             new_row = self.channel.load(ch)
