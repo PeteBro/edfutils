@@ -113,6 +113,11 @@ class _EditingMixin:
             mask = np.all(mask, axis=1)
 
         return np.where(mask)[0] if asint else mask
+    
+
+    def modify_event(self):
+        #TODO; Needs adding - modify event, triggers too maybe?
+        raise NotImplementedError
 
 
     def _insert_log_event(self, indices, events):

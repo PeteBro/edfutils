@@ -58,7 +58,7 @@ class _IOMixin:
         Raises:
             ValueError: If either column is not present in the log.
         """
-        self.log = pd.read_csv(log_path, sep=None, engine='python')
+        self.log = pd.read_csv(log_path, sep=None, engine='python').convert_dtypes()
 
         cols = [('trigger_column', trigger_column, pd.api.types.is_integer_dtype, 'int'),
                 ('onset_column', onset_column, pd.api.types.is_float_dtype, 'float')]
