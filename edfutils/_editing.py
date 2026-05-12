@@ -20,7 +20,7 @@ class _EditingMixin:
         self.log_times = self.log[self.onset_column].to_numpy()
         self.unique_log_triggers = np.unique(self.log_triggers)
 
-        self.log = self.log.reset_index(drop=True)
+        self.log = self.log.reset_index(drop=True).convert_dtypes()
 
 
     def get_eeg_events(self, drop_initial_event=True, minlength=0, verbose=True):
@@ -115,8 +115,15 @@ class _EditingMixin:
         return np.where(mask)[0] if asint else mask
     
 
+    def drop_event(self, indices):
+
+        #dropidcs = self.log.
+        #TODO; Needs adding - drop event and associated triggers
+        raise NotImplementedError
+
+
     def modify_event(self):
-        #TODO; Needs adding - modify event, triggers too maybe?
+        #TODO; Needs adding - modify event, triggers too maybe? - or maybe just modift trigger? pd has utilities for the rest
         raise NotImplementedError
 
 
@@ -312,3 +319,8 @@ class _EditingMixin:
             new.log = cropped_log
             new.get_eeg_events()
             return new
+
+
+    def append_data(self, data):
+        #TODO; allow appending of anoter datarun - either raw file or separate session object.
+        raise NotImplementedError

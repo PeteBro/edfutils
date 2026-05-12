@@ -69,7 +69,7 @@ class EEGSession(_IOMixin, _EditingMixin):
     @property
     def nsamples(self):
         """int: Total number of samples in the recording (from channel 0)."""
-        return self.reader.samples_in_file(0)
+        return self._data.shape[-1]
 
     @property
     def channels(self):
