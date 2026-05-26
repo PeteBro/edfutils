@@ -1,6 +1,7 @@
 """EEG recording session — core class combining all mixins."""
 
 import os
+import copy
 
 import numpy as np
 import pyedflib
@@ -61,6 +62,24 @@ class EEGSession(_IOMixin, _EditingMixin):
 
         self.read_data(channels=[self._trigger_channel_name], verbose=False)
         self._data[self._trigger_idx] = self.channel.decode(self._trigger_channel_name)
+
+    def __deepcopy__(self, memo):
+        """Return a deep copy that shares the open EDF reader handle.
+
+        ``pyedflib.EdfReader`` cannot be pickled and the same file cannot be
+        opened twice, so copies share the reader while copying mutable state.
+        """
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+
+        for key, value in self.__dict__.items():
+            if key == 'reader':
+                setattr(new, key, value)
+            else:
+                setattr(new, key, copy.deepcopy(value, memo))
+
+        return new
 
     ############
     # Properties

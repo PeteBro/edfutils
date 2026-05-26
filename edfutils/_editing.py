@@ -115,6 +115,17 @@ class _EditingMixin:
         return np.where(mask)[0] if asint else mask
     
 
+    def drop_event(self, idcs):
+
+        drop = self.log.iloc[idcs]
+        samples = np.concatenate(drop.trigger_idcs.to_list())
+        self.trigger_channel[samples] = self.trigger_default
+        self.log.drop(index=idcs, inplace=True)
+        self.log.reset_index(inplace=True, drop=True)
+        self.update_log()
+        self.get_eeg_events(verbose=False)
+
+
     def modify_event(self):
         #TODO; Needs adding - modify event, triggers too maybe?
         raise NotImplementedError
