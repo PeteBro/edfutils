@@ -101,8 +101,7 @@ class _IOMixin:
             path (str): Destination file path.
             **kwargs: Additional arguments passed to ``pd.DataFrame.to_csv``.
         """
-        self.log.drop(columns='trigger_idcs')
-        self.log.to_csv(path, **kwargs)
+        self.log.drop(columns='trigger_idcs').to_csv(path, **kwargs)
 
 
     def write_data(self, path, verbose=True):
