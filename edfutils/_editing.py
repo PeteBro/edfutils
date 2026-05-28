@@ -307,11 +307,22 @@ class _EditingMixin:
         cropped_log = self.log.loc[indices].copy()
 
         bdfspan = np.concatenate(cropped_log['trigger_idcs'].to_list())
-        bdfstart = bdfspan[0] - int(start_diff * self.sfreq)
-        bdfstop = bdfspan[-1] + int(stop_diff * self.sfreq)
-
+        front_pad = int(start_diff * self.sfreq)
+        end_pad = int(stop_diff * self.sfreq)
+        bdfstart = max(0, bdfspan[0] - front_pad)
+        bdfstop = min(self._data.shape[1], bdfspan[-1] + end_pad + 1)
+        
         cropped_channels = self._data[:, bdfstart:bdfstop].copy()
 
+        actual_front_pad = bdfspan[0] - bdfstart
+        actual_end_pad = bdfstop - bdfspan[-1] - 1
+
+        if actual_front_pad > 0:
+            cropped_channels[self._trigger_idx, :actual_front_pad] = self.trigger_default
+
+        if actual_end_pad > 0:
+            cropped_channels[self._trigger_idx, -actual_end_pad:] = self.trigger_default
+            
         if inplace:
             self._data = cropped_channels
             self.log = cropped_log
