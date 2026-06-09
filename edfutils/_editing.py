@@ -322,7 +322,7 @@ class _EditingMixin:
 
         if actual_end_pad > 0:
             cropped_channels[self._trigger_idx, -actual_end_pad:] = self.trigger_default
-            
+
         if inplace:
             self._data = cropped_channels
             self.log = cropped_log
@@ -332,5 +332,5 @@ class _EditingMixin:
             new = copy.deepcopy(self)
             new._data = cropped_channels
             new.log = cropped_log
-            new.get_eeg_events()
+            new.get_eeg_events(drop_initial_event=False)
             return new
