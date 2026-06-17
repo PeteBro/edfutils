@@ -218,15 +218,15 @@ class _EditingMixin:
 
         times = events[self.onset_column].to_numpy()
         indices = np.searchsorted(self.log.onset.to_numpy(), times)
-        self._insert_log_event(indices, events)
-        
+
         last_event = np.max(np.where(~self.log['trigger_idcs'].isna()))
         last_event = self.log.iloc[last_event]
         tdiffs = [last_event.onset - self.log.iloc[idx].onset for idx in indices]
 
         ref_samples = np.asarray(last_event.trigger_idcs)
-        insert_samples = [ref_samples -  int(tdiff*self.sfreq) for tdiff in tdiffs]        
+        insert_samples = [ref_samples -  int(tdiff*self.sfreq) for tdiff in tdiffs]  
 
+        self._insert_log_event(indices, events)      
         self._insert_eeg_triggers(
             list(events[self.trigger_column]),
             samples=insert_samples,
